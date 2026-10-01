@@ -73,6 +73,10 @@ export default function GateConfig() {
   const totalInflow = (): number =>
     gatesOfSeries().reduce((acc, gate) => acc + estimateInflowM3(gate, upstreamLevel(gate.fromPondId)), 0);
 
+  /** 开度变化后挂起待重算的未完成计划条数（已出卤历史计划不计） */
+  const staleScheduleCount = (): number =>
+    store.state.schedules.filter((row) => row.state !== '已出卤' && row.calcStatus === '待重算').length;
+
   const openCreate = (): void => {
     const ponds = store.pondsOfSeries(store.state.currentSeries);
     setEditingId(null);
@@ -136,8 +140,14 @@ export default function GateConfig() {
 
   const adjustOpening = async (gate: Gate, openingPct: number): Promise<void> => {
     const clamped = Math.max(0, Math.min(100, Math.round(openingPct)));
-    await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
-    setMessage(`已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%`);
+    if (clamped === gate.openingPct) return;
+    const affected = await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
+    setMessage(
+      `已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%` +
+        (affected > 0
+          ? `；沿串级下游 ${affected} 条走水计划已挂起为待重算（调度员锁过日期的只提示冲突），请到调度台重算`
+          : '；当前没有受影响的未完成计划'),
+    );
   };
 
   return (
@@ -163,6 +173,13 @@ export default function GateConfig() {
           suffix="m³/d"
           tone="info"
           hint="按各闸门开度、口宽与上游最近水位用简易堰流公式估算"
+        />
+        <StatBadge
+          label="开度变动挂起计划"
+          value={staleScheduleCount()}
+          suffix="条"
+          tone={staleScheduleCount() > 0 ? 'warning' : 'default'}
+          hint="本侧开度一变，沿串级下游受影响的未完成计划自动挂起为待重算；已锁定日期的计划重算时只提示冲突"
         />
       </div>
 

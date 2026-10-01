@@ -10,8 +10,9 @@ import type { Pond } from '../types/pond';
 import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
-import type { Schedule, ScheduleState } from '../types/schedule';
+import type { DataSide, Schedule, ScheduleCalcStatus, ScheduleState } from '../types/schedule';
 import { estimateEvapMm } from './brine';
+import { affectedPondIdsByGate, downstreamPondIds, type ForecastSuccess } from './forecast';
 import { nowIso } from './id';
 import { seedDatabase } from './seed';
 
@@ -19,10 +20,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -90,6 +91,30 @@ class BrinePondDatabase extends Dexie {
           }
         });
       });
+
+    // ---------- v3：走水计划接入串级推算（预计出卤日期 / 可用水量 / 重算状态 / 日期锁定 / 开度对账） ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, orderIndex, calcStatus, calcSide',
+      })
+      .upgrade(async (tx) => {
+        // 老计划补齐串级推算字段：默认未锁日期、待重算，由调度台按侧统一重算
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.dateLocked !== 'boolean') row.dateLocked = false;
+          if (typeof row.forecastDate !== 'string') row.forecastDate = '';
+          if (typeof row.availableWaterM3 !== 'number') row.availableWaterM3 = 0;
+          if (row.calcStatus !== '已算好' && row.calcStatus !== '重算失败') row.calcStatus = '待重算';
+          if (typeof row.calcSide !== 'string') row.calcSide = '';
+          if (typeof row.calcError !== 'string') row.calcError = '';
+          if (typeof row.calculatedAt !== 'string') row.calculatedAt = '';
+          if (typeof row.basisGateOpenings !== 'object' || row.basisGateOpenings === null) row.basisGateOpenings = {};
+          if (typeof row.mismatchConfirmedAt !== 'string') row.mismatchConfirmedAt = '';
+        });
+      });
   }
 }
 
@@ -124,7 +149,17 @@ export async function listPonds(): Promise<Pond[]> {
 }
 
 export async function putPond(row: Pond): Promise<void> {
-  await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.transaction('rw', db.ponds, db.schedules, async () => {
+    const previous = await db.ponds.get(row.id);
+    await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    // 面积 / 水深变化会改变池容上限（可用水量随之变化），本池未完成计划待重算
+    if (
+      previous !== undefined &&
+      (previous.areaM2 !== row.areaM2 || previous.depthCm !== row.depthCm)
+    ) {
+      await markSchedulesStaleByPonds([row.id]);
+    }
+  });
 }
 
 /** 删除蒸发池，并级联清理相关闸门、观测、化验与走水计划 */
@@ -146,17 +181,52 @@ export async function listGates(): Promise<Gate[]> {
   return db.gates.toArray();
 }
 
+/**
+ * 新建 / 保存闸门。
+ * 闸门走向（上/下游池）或开度变化会影响整段下游池，相关走水计划标成待重算；
+ * 已出卤的历史计划不再变动，调度员手工锁过日期的计划只标记、不改日期。
+ */
 export async function putGate(row: Gate): Promise<void> {
-  await db.gates.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.transaction('rw', db.gates, db.schedules, async () => {
+    const previous = await db.gates.get(row.id);
+    await db.gates.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    const allGates = await db.gates.toArray();
+    const affected = new Set<string>(affectedPondIdsByGate(row, allGates));
+    if (previous !== undefined) {
+      affectedPondIdsByGate(previous, allGates).forEach((id) => affected.add(id));
+    }
+    await markSchedulesStaleByPonds([...affected]);
+  });
 }
 
-/** 就地调整开度：同步推导闸门状态 */
-export async function updateGateOpening(id: string, openingPct: number, state: Gate['state']): Promise<void> {
-  await db.gates.update(id, { openingPct, state, updatedAt: nowIso() });
+/**
+ * 就地调整开度：同步推导闸门状态，并把开度变化沿串级传播——
+ * 受影响池的未完成计划标成待重算，返回受影响计划条数。
+ */
+export async function updateGateOpening(id: string, openingPct: number, state: Gate['state']): Promise<number> {
+  const stamp = nowIso();
+  return db.transaction('rw', db.gates, db.schedules, async () => {
+    const updated = await db.gates.update(id, { openingPct, state, updatedAt: stamp });
+    if (updated === 0) return 0;
+    const [gate, gates] = await Promise.all([db.gates.get(id), db.gates.toArray()]);
+    if (gate === undefined) return 0;
+    // 开度变化影响本闸上游池本身（外排能力）与沿串级的全部下游池（进水量）
+    const pondIds = Array.from(new Set([gate.fromPondId, ...downstreamPondIds(gate.fromPondId, gates)]));
+    return markSchedulesStaleByPonds(pondIds, stamp);
+  });
 }
 
+/** 删除闸门：走向断开后，原下游链路上的未完成计划标成待重算 */
 export async function removeGate(id: string): Promise<void> {
-  await db.gates.delete(id);
+  await db.transaction('rw', db.gates, db.schedules, async () => {
+    const gate = await db.gates.get(id);
+    if (gate !== undefined) {
+      const others = (await db.gates.toArray()).filter((item) => item.id !== id);
+      const pondIds = affectedPondIdsByGate(gate, others);
+      await markSchedulesStaleByPonds(pondIds);
+    }
+    await db.gates.delete(id);
+  });
 }
 
 /* ------------------------------ 卤水日观测 ------------------------------ */
@@ -174,23 +244,30 @@ export async function listObservationsByPond(pondId: string): Promise<Observatio
 /**
  * 写入卤水日观测：同池同日仅保留一条（存在即覆盖原记录）。
  * evapMm 若未显式给出，则按经验公式自动估算。
+ * 最近观测一变，本池（及沿串级的下游池）的预计出卤日期与可用水量随之变化，
+ * 相关未完成计划标成待重算。
  */
 export async function upsertObservation(row: Observation): Promise<Observation> {
   const evapMm =
     Number.isFinite(row.evapMm) && row.evapMm > 0
       ? row.evapMm
       : estimateEvapMm(row.densityGcm3, row.tempC, row.levelCm, row.windLevel);
-  const existing = await db.observations.where('[pondId+date]').equals([row.pondId, row.date]).first();
-  const next: Observation = {
-    ...row,
-    id: existing === undefined ? row.id : existing.id,
-    evapMm,
-    createdAt: existing === undefined ? row.createdAt : existing.createdAt,
-    updatedAt: nowIso(),
-    revision: ROW_REVISION,
-  };
-  await db.observations.put(next);
-  return next;
+  return db.transaction('rw', db.observations, db.schedules, db.gates, async () => {
+    const existing = await db.observations.where('[pondId+date]').equals([row.pondId, row.date]).first();
+    const next: Observation = {
+      ...row,
+      id: existing === undefined ? row.id : existing.id,
+      evapMm,
+      createdAt: existing === undefined ? row.createdAt : existing.createdAt,
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    };
+    await db.observations.put(next);
+    const gates = await db.gates.toArray();
+    // 本池密度变化直接影响本池出卤；本池水位变化还会影响经本池下泄的下游进水量
+    await markSchedulesStaleByPonds(downstreamPondIds(row.pondId, gates));
+    return next;
+  });
 }
 
 export async function removeObservation(id: string): Promise<void> {
@@ -224,8 +301,102 @@ export async function listSchedules(): Promise<Schedule[]> {
   return rows.sort((a, b) => a.orderIndex - b.orderIndex || a.planDate.localeCompare(b.planDate));
 }
 
+/** 重算字段缺省补齐，兼容旧存档 / 外部导入的 v2 结构 */
+export function normalizeSchedule(row: Partial<Schedule> & Pick<Schedule, 'id' | 'pondId'>): Schedule {
+  return {
+    planDate: row.planDate ?? '2026-01-01',
+    targetDensity: row.targetDensity ?? 0,
+    volumeM3: row.volumeM3 ?? 0,
+    operator: row.operator ?? '',
+    state: row.state ?? '待排',
+    orderIndex: row.orderIndex ?? 1,
+    dateLocked: row.dateLocked ?? false,
+    forecastDate: row.forecastDate ?? '',
+    availableWaterM3: row.availableWaterM3 ?? 0,
+    calcStatus: row.calcStatus ?? '待重算',
+    calcSide: (row.calcSide ?? '') as DataSide | '',
+    calcError: row.calcError ?? '',
+    calculatedAt: row.calculatedAt ?? '',
+    basisGateOpenings: row.basisGateOpenings ?? {},
+    mismatchConfirmedAt: row.mismatchConfirmedAt ?? '',
+    createdAt: row.createdAt ?? nowIso(),
+    updatedAt: row.updatedAt ?? nowIso(),
+    revision: row.revision ?? ROW_REVISION,
+    ...row,
+  } as Schedule;
+}
+
 export async function putSchedule(row: Schedule): Promise<void> {
-  await db.schedules.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.schedules.put({ ...normalizeSchedule(row), updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+/**
+ * 把给定池集合上的未完成计划标成待重算。
+ * - 已出卤（已完成）的历史计划不动；
+ * - 手工锁定日期的计划同样标记，重算时保住 planDate、只提示冲突；
+ * - 清空上轮失败原因与开度确认标记（闸门又动过，旧确认失效）。
+ * 返回被标记的计划条数。
+ */
+export async function markSchedulesStaleByPonds(pondIds: string[], stamp = nowIso()): Promise<number> {
+  if (pondIds.length === 0) return 0;
+  const rows = await db.schedules.where('pondId').anyOf(pondIds).toArray();
+  const targets = rows.filter((row) => row.state !== '已出卤' && row.calcStatus !== '待重算');
+  await Promise.all(
+    targets.map((row) =>
+      db.schedules.update(row.id, {
+        calcStatus: '待重算' as ScheduleCalcStatus,
+        calcSide: '',
+        calcError: '',
+        mismatchConfirmedAt: '',
+        updatedAt: stamp,
+      }),
+    ),
+  );
+  return targets.length;
+}
+
+/** 保存一次成功重算：锁定日期的计划保住 planDate，只刷新预计日期与可用水量 */
+export async function applyScheduleForecast(
+  scheduleId: string,
+  forecast: ForecastSuccess,
+  options: { dateLocked: boolean; planDate?: string },
+): Promise<void> {
+  const patch: Partial<Schedule> = {
+    forecastDate: forecast.forecastDate,
+    availableWaterM3: forecast.availableWaterM3,
+    calcStatus: '已算好',
+    calcSide: '',
+    calcError: '',
+    calculatedAt: nowIso(),
+    basisGateOpenings: forecast.basisGateOpenings,
+    mismatchConfirmedAt: '',
+  };
+  if (options.dateLocked) {
+    // 手工锁过日期：原日期不动，只记录新的预计日期供冲突提示
+  } else if (options.planDate !== undefined) {
+    patch.planDate = options.planDate;
+  }
+  await db.schedules.update(scheduleId, patch);
+}
+
+/** 保存一次失败重算：记录责任侧与原因，已算好的日期/水量字段原样保留 */
+export async function applyScheduleFailure(scheduleId: string, side: DataSide, reason: string): Promise<void> {
+  await db.schedules.update(scheduleId, {
+    calcStatus: '重算失败',
+    calcSide: side,
+    calcError: reason,
+    updatedAt: nowIso(),
+  });
+}
+
+/** 手工锁定 / 解锁计划日期（解锁本身不改任何日期） */
+export async function setScheduleDateLocked(scheduleId: string, dateLocked: boolean): Promise<void> {
+  await db.schedules.update(scheduleId, { dateLocked, updatedAt: nowIso() });
+}
+
+/** 确认本计划与闸门开度记录的短时不一致：按池号对账后不再提示，闸门再动会重新挂起 */
+export async function confirmScheduleMismatch(scheduleId: string, stamp = nowIso()): Promise<void> {
+  await db.schedules.update(scheduleId, { mismatchConfirmedAt: stamp, updatedAt: stamp });
 }
 
 export async function removeSchedule(id: string): Promise<void> {
@@ -311,7 +482,17 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
+    // 兼容 v2 存档：补齐串级推算字段后，未算过的计划统一挂起为待重算
+    await db.schedules.bulkPut(
+      snapshot.schedules.map((row) => {
+        const normalized = normalizeSchedule(row);
+        return {
+          ...normalized,
+          calcStatus: normalized.calculatedAt === '' && normalized.forecastDate === '' ? '待重算' : normalized.calcStatus,
+          revision: ROW_REVISION,
+        };
+      }),
+    );
   });
 }
 

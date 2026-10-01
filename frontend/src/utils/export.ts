@@ -122,6 +122,51 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
         .join(','),
     );
   });
+
+  // 走水计划串级推算明细：预计出卤日期 / 可用水量 / 重算状态 / 日期锁定
+  lines.push('');
+  lines.push(
+    [
+      '走水计划-池号',
+      '计划日期',
+      '预计出卤日期',
+      '日期锁定',
+      '日期冲突',
+      '可用水量(m³)',
+      '目标密度(g/cm³)',
+      '重算状态',
+      '失败责任侧',
+      '失败原因',
+      '走水状态',
+      '调度员',
+    ]
+      .map(csvCell)
+      .join(','),
+  );
+  const pondCodeById = new Map(ponds.map((pond) => [pond.id, pond.code]));
+  [...schedules]
+    .sort((a, b) => a.orderIndex - b.orderIndex || a.planDate.localeCompare(b.planDate))
+    .forEach((schedule) => {
+      const conflict = schedule.dateLocked && schedule.forecastDate !== '' && schedule.forecastDate !== schedule.planDate;
+      lines.push(
+        [
+          pondCodeById.get(schedule.pondId) ?? '（池已删除）',
+          schedule.planDate,
+          schedule.forecastDate === '' ? '—' : schedule.forecastDate,
+          schedule.dateLocked ? '是' : '否',
+          conflict ? '是' : '否',
+          schedule.availableWaterM3,
+          schedule.targetDensity,
+          schedule.calcStatus,
+          schedule.calcSide === '' ? '—' : schedule.calcSide,
+          schedule.calcError === '' ? '—' : schedule.calcError,
+          schedule.state,
+          schedule.operator,
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    });
   return `\uFEFF${lines.join('\n')}`;
 }
 
@@ -158,13 +203,14 @@ export function buildBriefingText(ponds: Pond[], observations: Observation[], as
     const latest = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
     const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const lastAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
-    const pending = schedules.filter((row) => row.pondId === pond.id && row.state !== '已出卤').length;
+    const pending = schedules.filter((row) => row.pondId === pond.id && row.state !== '已出卤');
+    const stale = pending.filter((row) => row.calcStatus !== '已算好').length;
     lines.push(
       `· ${pond.code}（${pond.seriesName} / ${pond.stage} / ${pond.status}）最近密度 ${
         latest === null ? '无观测' : `${latest.densityGcm3} g/cm³（${latest.date}）`
       }，蒸发量 ${latest === null ? '—' : `${round1(latest.evapMm)} mm/d`}，组分判定 ${
         lastAssay === null ? '未化验' : effectiveVerdict(lastAssay)
-      }，待完成走水 ${pending} 条`,
+      }，待完成走水 ${pending.length} 条${stale > 0 ? `（其中 ${stale} 条待重算）` : ''}`,
     );
   });
   return lines.join('\n');

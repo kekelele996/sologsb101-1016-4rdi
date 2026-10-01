@@ -10,6 +10,7 @@ import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
 import { autoVerdict, estimateEvapMm } from './brine';
+import { forecastSchedule } from './forecast';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
 
@@ -129,13 +130,63 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
-  const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+  // 预计出卤日期 / 可用水量由串级推算引擎按闸门开度与最近观测当场算出，保证演示数据一上来就是「已算好」。
+  type RawSchedule = {
+    id: string
+    pondId: string
+    planDate: string
+    targetDensity: number
+    volumeM3: number
+    operator: string
+    state: Schedule['state']
+    orderIndex: number
+    /** 调度员手工锁定日期：重算保住 planDate，仅在与预计日期不一致时提示冲突 */
+    dateLocked?: boolean
+  }
+  const rawSchedules: RawSchedule[] = [
+    { id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 },
+    { id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 },
+    { id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 },
+    { id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4, dateLocked: true },
+    { id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 },
   ];
+
+  const schedules: Schedule[] = rawSchedules.map((raw) => {
+    const result = forecastSchedule(raw, ponds, gates, observations);
+    const base: Schedule = wrap<Schedule>({
+      id: raw.id,
+      pondId: raw.pondId,
+      planDate: raw.planDate,
+      targetDensity: raw.targetDensity,
+      volumeM3: raw.volumeM3,
+      operator: raw.operator,
+      state: raw.state,
+      orderIndex: raw.orderIndex,
+      dateLocked: raw.dateLocked ?? false,
+      forecastDate: '',
+      availableWaterM3: 0,
+      calcStatus: '待重算',
+      calcSide: '',
+      calcError: '',
+      calculatedAt: '',
+      basisGateOpenings: {},
+      mismatchConfirmedAt: '',
+    });
+    if (result.ok) {
+      // 未锁日期的计划直接对齐到预计出卤日期；锁日期的计划保住原计划日期
+      base.forecastDate = result.forecastDate;
+      base.availableWaterM3 = result.availableWaterM3;
+      base.calcStatus = '已算好';
+      base.calculatedAt = SEED_TIME;
+      base.basisGateOpenings = result.basisGateOpenings;
+      if (!base.dateLocked) base.planDate = result.forecastDate;
+    } else {
+      base.calcStatus = '重算失败';
+      base.calcSide = result.side;
+      base.calcError = result.reason;
+    }
+    return base;
+  });
 
   await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
     await db.ponds.bulkPut(ponds);

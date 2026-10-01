@@ -113,7 +113,7 @@ export default function ExportView() {
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表，v2 新增 evapMm，v3 走水计划接入串级推算（预计出卤日期/可用水量/重算状态/日期锁定）"
         />
       </div>
 

@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm`；`v2 → v3` 走水计划接入串级推算（预计出卤日期 / 可用水量 / 重算状态 / 日期锁定 / 开度对账） |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -75,7 +75,7 @@ sologsb101-1016/
         ├── hooks/              # useEvaporation.ts useIdbTable.ts
         ├── pages/              # 6 个模块页面
         ├── router/index.tsx    # AppRouter + ROUTES 常量 + NAV_ITEMS
-        └── utils/              # brine.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # brine.ts forecast.ts db.ts export.ts seed.ts id.ts
 ```
 
 ---
@@ -88,7 +88,7 @@ sologsb101-1016/
 | `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量 |
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
-| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
+| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段；按串级走向与最近观测重算预计出卤日期/可用水量，待重算计划支持按责任侧重试，锁定日期只提示冲突，开度不一致按池号对账 |
 | `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
@@ -101,11 +101,15 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**走水计划接入闸门串级与卤水日观测**，新增 `dateLocked`（手工锁日期）、
+    `forecastDate`（预计出卤日期）、`availableWaterM3`（可用水量）、`calcStatus`（已算好/待重算/重算失败）、
+    `calcSide`（失败责任侧：闸门侧/调度侧）、`calcError`、`calculatedAt`、`basisGateOpenings`（重算依据开度快照）、
+    `mismatchConfirmedAt`（开度不一致确认时间）；老计划统一迁移为「待重算」，由调度台重算，已出卤历史计划不动。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -114,7 +118,7 @@ sologsb101-1016/
   | `gates` | id | fromPondId, toPondId, state, openingPct |
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
-  | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `schedules` | id | pondId, planDate, state, orderIndex, calcStatus, calcSide |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -157,3 +161,21 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+
+### 串级联动重算（`src/utils/forecast.ts`，v3 新增）
+
+调度台的每条计划都由「闸门串级走向 × 卤水日观测」推算预计出卤日期与可用水量：
+
+* **预计出卤日期**：取最近观测的密度增速 `(末次密度 − 首次密度) / 观测跨度`，
+  按「日进水量 / 池有效体积」对浓缩天数做稀释折减，从最近观测日期外推到目标密度。
+* **可用水量**：沿串级所有直接进入本池的未关闭闸门过流（简易堰流公式 × 上游最近水位）合计为日进水量，
+  乘以到达目标密度天数，并以池有效体积封顶；无上游闸门的源头池按池有效体积兜底。
+* **开度/观测变动挂起**：闸门开度调整沿「本闸上游池 + 串级下游」传播，卤水日观测写入沿下游传播，
+  受影响的未完成计划自动标成**待重算**；「已出卤」历史计划不再变动。
+* **手工锁定日期**：`dateLocked = true` 的计划重算只刷新预计日期与可用水量，**保住原计划日期**；
+  预计日期与计划日期不一致时在页面顶部与行内提示冲突，不自动改期。
+* **两侧各自管本侧数据**：闸门工的开度记录允许与计划重算依据短时不一致，
+  调度台按**池号**分组列出不一致闸门，逐条「确认」后不再提示；闸门再次调整会自动重新挂起。
+* **重算失败按侧重试**：失败原因归两个责任侧——闸门侧（上游闸门缺失 / 全部关闭）与
+  调度侧（池缺失 / 无观测或仅单日观测 / 密度无增长）。可整批重算，也可只重试闸门侧或调度侧；
+  重算逐条独立落库，**中途失败后已算好的计划不再重复生成**，下次只处理剩余待重算/失败条目。
