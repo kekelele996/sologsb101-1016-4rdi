@@ -128,13 +128,13 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后；新字段待首次打开编排台时按串级重算） ----------------
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1, lockedDate: false, recalcState: '待重算', expectedDate: '', availableVolumeM3: 0, openingSnapshot: [], conflict: false, conflictNote: '' }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2, lockedDate: false, recalcState: '待重算', expectedDate: '', availableVolumeM3: 0, openingSnapshot: [], conflict: false, conflictNote: '' }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3, lockedDate: true, recalcState: '待重算', expectedDate: '', availableVolumeM3: 0, openingSnapshot: [], conflict: false, conflictNote: '' }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4, lockedDate: false, recalcState: '待重算', expectedDate: '', availableVolumeM3: 0, openingSnapshot: [], conflict: false, conflictNote: '' }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5, lockedDate: false, recalcState: '已算好', expectedDate: '', availableVolumeM3: 0, openingSnapshot: [], conflict: false, conflictNote: '' }),
   ];
 
   await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {

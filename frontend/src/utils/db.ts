@@ -19,10 +19,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
-/** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+/** 数据行结构修订号（v3：走水计划新增锁日期 / 重算状态 / 预计出卤日期 / 可用水量 / 开度快照） */
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -88,6 +88,28 @@ class BrinePondDatabase extends Dexie {
             const date = typeof row.planDate === 'string' ? row.planDate : '2026-01-01';
             row.orderIndex = Number(date.replace(/-/g, '')) || 1;
           }
+        });
+      });
+
+    // ---------- v3：走水计划接入串级重算（锁日期 / 待重算标记 / 预计出卤 / 可用水量 / 开度快照） ----------
+    this.version(3)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, recalcState, orderIndex',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 5：走水计划补齐串级重算字段；旧计划从未重算，统一标为「待重算」
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.lockedDate !== 'boolean') row.lockedDate = false;
+          if (typeof row.recalcState !== 'string') row.recalcState = '待重算';
+          if (typeof row.expectedDate !== 'string') row.expectedDate = '';
+          if (typeof row.availableVolumeM3 !== 'number') row.availableVolumeM3 = 0;
+          if (!Array.isArray(row.openingSnapshot)) row.openingSnapshot = [];
+          if (typeof row.conflict !== 'boolean') row.conflict = false;
+          if (typeof row.conflictNote !== 'string') row.conflictNote = '';
         });
       });
   }
@@ -237,6 +259,27 @@ export async function reorderSchedules(orderedIds: string[]): Promise<void> {
   await db.transaction('rw', db.schedules, async () => {
     for (let index = 0; index < orderedIds.length; index += 1) {
       await db.schedules.update(orderedIds[index], { orderIndex: index + 1, updatedAt: nowIso() });
+    }
+  });
+}
+
+/**
+ * 批量标记走水计划为「待重算」：闸门开度或卤水日观测变化后，
+ * 受影响的计划（非已出卤）清空旧的冲突提示，等待按串级走向重算。
+ * 已出卤的计划不再重算（算好的计划不再生成）。
+ */
+export async function markSchedulesStale(scheduleIds: string[]): Promise<void> {
+  if (scheduleIds.length === 0) return;
+  await db.transaction('rw', db.schedules, async () => {
+    for (const id of scheduleIds) {
+      const row = await db.schedules.get(id);
+      if (row === undefined || row.state === '已出卤') continue;
+      await db.schedules.update(id, {
+        recalcState: '待重算',
+        conflict: false,
+        conflictNote: '',
+        updatedAt: nowIso(),
+      });
     }
   });
 }

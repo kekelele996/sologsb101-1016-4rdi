@@ -11,6 +11,7 @@ import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import { useObservationStore, type BatchRow } from '../stores/observationStore';
 import { usePondStore } from '../stores/pondStore';
+import { useScheduleStore } from '../stores/scheduleStore';
 import type { Observation, ObservationDraft } from '../types/observation';
 import { estimateEvapMm } from '../utils/brine';
 import { db, removeObservation } from '../utils/db';
@@ -31,6 +32,7 @@ function emptyDraft(pondId: string): ObservationDraft {
 export default function ObservationEntry() {
   const observationStore = useObservationStore();
   const pondStore = usePondStore();
+  const scheduleStore = useScheduleStore();
 
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [batchOpen, setBatchOpen] = createSignal(false);
@@ -150,6 +152,8 @@ export default function ObservationEntry() {
     await removeObservation(row.id);
     setDeleting(null);
     observationStore.setLastMessage(`已删除 ${row.date} 的观测记录`);
+    // 最近观测减少后重算该池计划的预计出卤日期
+    await scheduleStore.notifyObservationChanged(row.pondId);
   };
 
   return (

@@ -1,9 +1,11 @@
 /**
  * /gates 串级走向与闸门配置
- * 按池系渲染串级拓扑，开度就地编辑；开度调整后重算下游预计进水量。
- * 消费模型：Gate、Pond、Observation；复用组件：<FilterBar>、<StageTag>、<EmptyPanel>、<StatBadge>
+ * 按池系渲染串级拓扑，开度就地编辑；开度调整后重算下游预计进水量，
+ * 并把下游沿串级受影响的走水计划标记「待重算」、给出新日期。
+ * 计划快照开度与闸门工记录开度允许短时不一致，按池号列出供确认。
+ * 消费模型：Gate、Pond、Observation、Schedule；复用组件：<FilterBar>、<StageTag>、<EmptyPanel>、<StatBadge>
  */
-import { For, Show, createSignal, onMount } from 'solid-js';
+import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import { createStore } from 'solid-js/store';
 import AppDialog from '../components/common/AppDialog';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -11,10 +13,12 @@ import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
+import { useScheduleStore } from '../stores/scheduleStore';
 import { GATE_STATE_OPTIONS, type Gate, type GateDraft, type GateState } from '../types/gate';
 import { estimateInflowM3, gateFlowAreaM2, stateFromOpening } from '../utils/brine';
 import { putGate, removeGate, updateGateOpening } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
+import { findOpeningMismatches, type OpeningMismatch } from '../utils/scheduleCalc';
 
 const INPUT =
   'w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm outline-none focus:border-brine-500 focus:ring-1 focus:ring-brine-400';
@@ -35,12 +39,33 @@ const DEFAULT_DRAFT: GateDraft = {
 
 export default function GateConfig() {
   const store = usePondStore();
+  const scheduleStore = useScheduleStore();
 
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
   const [deletingGate, setDeletingGate] = createSignal<Gate | null>(null);
   const [message, setMessage] = createSignal('');
   const [draft, setDraft] = createStore<GateDraft>({ ...DEFAULT_DRAFT });
+
+  // 开度核对确认记录（闸门工本侧数据，只存本机界面偏好）：gateId → 已确认的实际开度
+  const ACK_KEY = 'gbbrinepond:opening-ack';
+  const readAck = (): Record<string, number> => {
+    try {
+      const raw = window.localStorage.getItem(ACK_KEY);
+      return raw === null ? {} : (JSON.parse(raw) as Record<string, number>);
+    } catch {
+      return {};
+    }
+  };
+  const [ack, setAck] = createStore<Record<string, number>>(readAck());
+  const confirmMismatch = (item: OpeningMismatch): void => {
+    setAck(item.gateId, item.actualOpeningPct);
+    try {
+      window.localStorage.setItem(ACK_KEY, JSON.stringify({ ...ack }));
+    } catch {
+      /* 隐私模式下静默降级 */
+    }
+  };
 
   onMount(() => {
     void store.loadAll();
@@ -72,6 +97,12 @@ export default function GateConfig() {
 
   const totalInflow = (): number =>
     gatesOfSeries().reduce((acc, gate) => acc + estimateInflowM3(gate, upstreamLevel(gate.fromPondId)), 0);
+
+  /** 计划快照开度与闸门工实际开度不一致、且尚未确认的条目（按池号列出） */
+  const mismatches = createMemo<OpeningMismatch[]>(() => {
+    const all = findOpeningMismatches(scheduleStore.state.rows, store.state.gates, store.state.ponds);
+    return all.filter((item) => ack[item.gateId] !== item.actualOpeningPct);
+  });
 
   const openCreate = (): void => {
     const ponds = store.pondsOfSeries(store.state.currentSeries);
@@ -109,19 +140,25 @@ export default function GateConfig() {
     const payload: GateDraft = { ...draft, state: stateFromOpening(draft.openingPct) };
     if (editingId() === null) {
       const stamp = nowIso();
-      await putGate({
+      const saved: Gate = {
         id: uuid('gate'),
         ...payload,
         createdAt: stamp,
         updatedAt: stamp,
-        revision: 2,
-      });
-      setMessage(`已新建闸门：${pondLabel(payload.fromPondId)} → ${pondLabel(payload.toPondId)}`);
+        revision: 3,
+      };
+      await putGate(saved);
+      // 新建闸门改变下游来水：受影响计划标待重算
+      await scheduleStore.notifyGateChanged(saved);
+      setMessage(`已新建闸门：${pondLabel(payload.fromPondId)} → ${pondLabel(payload.toPondId)}，下游受影响计划已标记待重算`);
     } else {
       const existing = store.state.gates.find((gate) => gate.id === editingId());
       if (existing === undefined) return;
-      await putGate({ ...existing, ...payload });
-      setMessage('闸门配置已更新');
+      const saved: Gate = { ...existing, ...payload };
+      await putGate(saved);
+      // 闸门配置变化后，新串级走向的下游计划标待重算；旧走向下游可在编排台手动重算
+      await scheduleStore.notifyGateChanged(saved);
+      setMessage('闸门配置已更新，下游受影响计划已标记待重算');
     }
     setDialogOpen(false);
   };
@@ -131,13 +168,19 @@ export default function GateConfig() {
     if (gate === null) return;
     await removeGate(gate.id);
     setDeletingGate(null);
-    setMessage('闸门已删除');
+    // 删除闸门后下游来水消失：受影响计划标待重算
+    await scheduleStore.notifyGateChanged(gate);
+    setMessage('闸门已删除，下游受影响计划已标记待重算');
   };
 
   const adjustOpening = async (gate: Gate, openingPct: number): Promise<void> => {
     const clamped = Math.max(0, Math.min(100, Math.round(openingPct)));
     await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
-    setMessage(`已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%`);
+    // 开度一变，下游沿串级受影响的走水计划标成「待重算」，并按最近观测重算新日期
+    await scheduleStore.notifyGateChanged({ ...gate, openingPct: clamped, state: stateFromOpening(clamped) });
+    setMessage(
+      `已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%，下游受影响的走水计划已标记待重算`,
+    );
   };
 
   return (
@@ -302,6 +345,59 @@ export default function GateConfig() {
             actionText="新建闸门"
             onAction={openCreate}
           />
+        </Show>
+      </section>
+
+      <section class="rounded-xl border border-slate-200 bg-white p-4">
+        <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 class="text-[15px] font-semibold text-slate-800">计划开度核对（按池号）</h2>
+            <p class="mt-0.5 text-xs text-slate-500">
+              走水计划里快照的是上次重算时的开度，闸门工管理的是当前实际开度；两边允许短时不一致，对不上的按池号列出确认，互不覆盖。
+            </p>
+          </div>
+          <span
+            class={`rounded-full px-2.5 py-1 text-xs font-medium ${
+              mismatches().length === 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+            }`}
+          >
+            {mismatches().length} 条待确认
+          </span>
+        </header>
+
+        <Show
+          when={mismatches().length > 0}
+          fallback={
+            <p class="rounded-lg border border-dashed border-slate-200 bg-slate-50/60 px-3 py-4 text-center text-xs text-slate-500">
+              各池计划快照开度与闸门工当前实际开度一致。调整任一闸门开度后，这里会按池号列出差异。
+            </p>
+          }
+        >
+          <ul class="space-y-2">
+            <For each={mismatches()}>
+              {(item) => (
+                <li class="flex flex-wrap items-center gap-3 rounded-lg border border-amber-200 bg-amber-50/60 px-3.5 py-2.5">
+                  <span class="text-sm font-medium text-slate-800">{item.pondCode}</span>
+                  <span class="text-xs text-slate-500">{item.gateLabel}</span>
+                  <span class="rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] text-slate-600">
+                    计划开度 {item.planOpeningPct}%
+                  </span>
+                  <span class="text-slate-400">→</span>
+                  <span class="rounded border border-amber-300 bg-white px-2 py-0.5 text-[11px] font-medium text-amber-700">
+                    实际开度 {item.actualOpeningPct}%
+                  </span>
+                  <span class="text-xs text-amber-700">调度台计划仍按旧开度排期，请确认后通知调度台重算</span>
+                  <button
+                    type="button"
+                    class="ml-auto rounded-md border border-amber-300 bg-white px-2.5 py-1 text-xs text-amber-700 transition hover:bg-amber-100"
+                    onClick={() => confirmMismatch(item)}
+                  >
+                    确认核对
+                  </button>
+                </li>
+              )}
+            </For>
+          </ul>
         </Show>
       </section>
 

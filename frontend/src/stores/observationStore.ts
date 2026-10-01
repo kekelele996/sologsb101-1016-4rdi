@@ -9,6 +9,7 @@ import { db, initDatabase, upsertObservation } from '../utils/db';
 import { round1 } from '../utils/brine';
 import { nowIso, today, uuid } from '../utils/id';
 import type { ObservationDraft } from '../types/observation';
+import { useScheduleStore } from './scheduleStore';
 
 /** 观测筛选条件（关键字 + 池系 + 日期区间），同步到 URL query */
 export interface ObservationFilters {
@@ -102,6 +103,7 @@ function createObservationStore() {
   /** 批量录入：同池同日覆盖写入 */
   async function batchUpsert(ponds: Array<{ id: string; code: string }>, list: BatchRow[]): Promise<number> {
     let count = 0;
+    const affectedPondIds = new Set<string>();
     for (const row of list) {
       const pond = ponds.find((item) => item.code === row.pondCode);
       if (pond === undefined) continue;
@@ -120,9 +122,17 @@ function createObservationStore() {
         revision: 2,
       };
       await upsertObservation(draft);
+      affectedPondIds.add(pond.id);
       count += 1;
     }
     setLastMessage(count === 0 ? '没有可写入的行，请检查池号是否正确' : `已批量写入 ${count} 条卤水日观测`);
+    // 观测变化后，相关池的走水计划标记待重算并按串级重算预计出卤日期
+    if (count > 0) {
+      const scheduleStore = useScheduleStore();
+      for (const pondId of affectedPondIds) {
+        await scheduleStore.notifyObservationChanged(pondId);
+      }
+    }
     return count;
   }
 
@@ -143,6 +153,9 @@ function createObservationStore() {
       revision: 2,
     });
     setLastMessage(`已保存 ${row.date} 的观测记录（同池同日自动覆盖）`);
+    // 最近观测是预计出卤日期的外推依据，保存后重算该池计划
+    const scheduleStore = useScheduleStore();
+    await scheduleStore.notifyObservationChanged(row.pondId);
     return row;
   }
 
